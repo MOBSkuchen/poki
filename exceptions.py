@@ -27,3 +27,6 @@ class Exceptions:
         def __init__(self, msg, level, *args):
             super().__init__(self, "Invalid format", msg, level, *args)
 
+    class UnsupportedError(BaseException):
+        def __init__(self, msg, level, *args):
+            super().__init__(self, "Unsupported operation", msg, level, *args)

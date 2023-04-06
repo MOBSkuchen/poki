@@ -58,6 +58,12 @@ def decompress(file, size):
     return stream
 
 
+def compress(file, size):
+    zstd = zst.ZstdCompressor()
+    stream = zstd.stream_writer(file, size)
+    return stream
+
+
 def level_decompile(level, file, size):
     match level:
         case "C":
@@ -71,6 +77,21 @@ def level_decompile(level, file, size):
             return file
         case _:
             raise Exceptions.HeaderError(f"'{level}' is invalid", "level_decompile")
+
+
+def level_compile(level, file, size):
+    match level:
+        case "C":
+            return compress(file, size)
+        case "S":
+            raise NotImplementedError("Not Implemented : Secured database")
+        case "X":
+            file = compress(file, size)
+            return file
+        case "N":
+            return file
+        case _:
+            raise Exceptions.HeaderError(f"'{level}' is invalid", "level_compile")
 
 
 def get_atom_value(file, idx, size):
@@ -191,35 +212,45 @@ def make_pin(borrow, name, value, mt_br):
     return pin
 
 
-def load_cluster(file, idx, size, mt_br):
+def load_cluster_B(cluster_name, mt_br, file, cluster_size, idx, size, __idx):
     cluster_content = []
-
-    idx, cluster_size, cluster_name = get_sub_header(file, idx, size)
-    __idx = copy.copy(idx)
-
     while (cluster_size + __idx) > idx:
         borrow, name, value, idx, t = get_piece(file, idx, size)
         file.read(1)
         idx += 1
 
         if t == 0:
-            cluster_content.append(make_atom(borrow, name, value, mt_br))
+            at = make_atom(borrow, name, value, mt_br)
         else:
-            cluster_content.append(make_pin(borrow, name, value, mt_br))
+            at = make_pin(borrow, name, value, mt_br)
+
+        cluster_content.append(at)
 
     cluster = Cluster(cluster_name, cluster_content)
 
     return cluster, idx
 
 
-def open_jar(file, idx, size, mt_br):
-    idx, jar_size, jar_name = get_sub_header(file, idx, size)
+def load_cluster_A(file, idx, size, mt_br):
+
+    idx, cluster_size, cluster_name = get_sub_header(file, idx, size)
+    __idx = copy.copy(idx)
+
+    return load_cluster_B(cluster_name, mt_br, file, cluster_size, idx, size, __idx)
+
+
+def open_jar_B(file, jar_name, jar_size, idx):
     content = file.read(jar_size)
     jar = Jar(jar_name, pickle.loads(content))
     del content
     file.read(1)
     idx += 1
     return jar, idx
+
+
+def open_jar_A(file, idx, size, mt_br):
+    idx, jar_size, jar_name = get_sub_header(file, idx, size)
+    return open_jar_B(file, jar_name, jar_size, idx)
 
 
 def __load(filename, maintain_borrows):
@@ -233,10 +264,10 @@ def __load(filename, maintain_borrows):
             idx += 1
             match head:
                 case b"$":  # Cluster
-                    cluster, idx = load_cluster(file, idx, size, maintain_borrows)
+                    cluster, idx = load_cluster_A(file, idx, size, maintain_borrows)
                     database.add(cluster)
                 case b"?":  # Jar (Pickle)
-                    jar, idx = open_jar(file, idx, size, maintain_borrows)
+                    jar, idx = open_jar_A(file, idx, size, maintain_borrows)
                     database.add(jar)
                 case b"":   # EOF
                     break
