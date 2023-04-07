@@ -1,7 +1,6 @@
 import io
 from exceptions import Exceptions
 from structures import Atom, Cluster, DataBase, Jar, Pin
-from tools import load
 
 
 def db_make():
@@ -23,6 +22,11 @@ def main():
     db = DataBase("database", "database.db")
     element = db.load(name="words")
     element.add(element[1].borrow())
+    # db.update_all()
+
+    gen = db.find("words")
+    for i in gen:
+        print(i)
 
 
 if __name__ == '__main__':

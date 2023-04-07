@@ -4,29 +4,28 @@ class Exceptions:
             self.head = head
             self.msg = msg
             self.level = level
-            self.__head = head
-            super().__init__(self)
+            super().__init__(self, *args)
 
     class HeaderError(BaseException):
         def __init__(self, msg, level, *args):
-            super().__init__(self, "Unexpected header", msg, level, *args)
+            super().__init__("Unexpected header", msg, level, *args)
 
     class BufferError(BaseException):
         def __init__(self, msg, level, *args):
-            super().__init__(self, "Unexpected end of data", msg, level, *args)
+            super().__init__("Unexpected end of data", msg, level, *args)
 
     class SubHeadError(BaseException):
         def __init__(self, msg, level, *args):
-            super().__init__(self, "Unexpected sub header", msg, level, *args)
+            super().__init__("Unexpected sub header", msg, level, *args)
 
     class BorrowError(BaseException):
         def __init__(self, msg, level, *args):
-            super().__init__(self, "Invalid Borrow", msg, level, *args)
+            super().__init__("Invalid Borrow", msg, level, *args)
 
     class CorruptionError(BaseException):
         def __init__(self, msg, level, *args):
-            super().__init__(self, "Invalid format", msg, level, *args)
+            super().__init__("Invalid format", msg, level, *args)
 
     class UnsupportedError(BaseException):
         def __init__(self, msg, level, *args):
-            super().__init__(self, "Unsupported operation", msg, level, *args)
+            super().__init__("Unsupported operation", msg, level, *args)

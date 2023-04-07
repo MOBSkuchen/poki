@@ -1,3 +1,4 @@
+import regex
 from exceptions import Exceptions
 import os
 import copy
@@ -6,11 +7,63 @@ import zstandard as zst
 from structures import Atom, Borrow, Jar, Pin, Cluster, DataBase
 import structures
 
-
 part = {}
 
 
+# This is modified from:
+# https://stackoverflow.com/a/43060761/16595859
+def stream_regex(pattern, file, chunksize=8192):
+    window = pattern[:0]
+    sentinel = object()
+
+    last_chunk = False
+
+    while not last_chunk:
+        chunk = file.read(chunksize)
+        if not chunk:
+            last_chunk = True
+        window += chunk
+
+        match = sentinel
+        for match in regex.finditer(pattern, window, partial=not last_chunk):
+            if not match.partial:
+                pos = match.start(), match.end()
+                yield pos
+
+        if match is sentinel or not match.partial:
+            window = window[:0]
+        else:
+            window = window[match.start():]
+            if match.start() == 0:
+                chunksize *= 2
+
+
+def find_sub_header(file, name, size=None):
+    if size is None:
+        size = "*"
+    pat = '[\=|\?]{name}+:{size}'.format(name=name, size=size).encode()
+    gen = stream_regex(pat, file)
+    return gen
+
+
 def get_db_header(file, size):
+    """
+    Get database headers:
+    - level (S, C, X, N)
+    - realname (filename)
+    - name
+    - size (in compressed databases, the size is contained in the header)
+    :param file:
+    File `BufferReader` (rb)
+    :param size:
+    Naive filesize (as returned by os.path.getsize)
+    :return:
+    - level: str
+    - realname: str
+    - name: str
+    - index: int
+    - size: int
+    """
     val = b''
     name = None
     realname = None
@@ -33,21 +86,24 @@ def get_db_header(file, size):
         else:
             val += b
 
-    if level == "N":
-        idx += 1
-        file.read(1)
-    else:
-        _raw_size = b""
-        while size > idx:
+    try:
+        if level == "N":
             idx += 1
-            b = file.read(1)
-            if b == b'\n':
-                break
-            _raw_size += b
-        size = int(_raw_size.decode()) + idx
+            file.read(1)
+        else:
+            _raw_size = b""
+            while size > idx:
+                idx += 1
+                b = file.read(1)
+                if b == b'\n':
+                    break
+                _raw_size += b
+            size = int(_raw_size.decode()) + idx
+    except ValueError:
+        raise Exceptions.HeaderError(f"Invalid header", "get_db_header")
 
     if name is None or realname is None:
-        raise Exceptions.BufferError(f"Too few bytes in headers", "get_names")
+        raise Exceptions.BufferError(f"Too few bytes in headers", "get_db_header")
 
     return level, realname.decode(), name.decode(), idx, size
 
@@ -65,6 +121,22 @@ def compress(file, size):
 
 
 def level_decompile(level, file, size):
+    """
+    Make file compatible with the given
+    level.
+    :param level:
+    One of
+    C: compressed,
+    S: secured,
+    X: secured and compressed,
+    N: normal
+    :param file:
+    Ordinary `BufferReader` (rb)
+    :param size:
+    Total file size
+    :return:
+    Compatible file `BufferReader`
+        """
     match level:
         case "C":
             return decompress(file, size)
@@ -80,6 +152,22 @@ def level_decompile(level, file, size):
 
 
 def level_compile(level, file, size):
+    """
+    Make file compatible with the given
+    level.
+    :param level:
+    One of
+    C: compressed,
+    S: secured,
+    X: secured and compressed,
+    N: normal
+    :param file:
+    Ordinary `BufferWriter` (wb)
+    :param size:
+    Total file size
+    :return:
+    Compatible file `BufferWriter`
+    """
     match level:
         case "C":
             return compress(file, size)
@@ -136,7 +224,7 @@ def get_piece(file, idx, size):
     name = ""
     h = file.read(1).decode()
     idx += 1
-    if h == "!":
+    if h == "!":  # Indicate PIN
         t = 1
         borrow, value, idx = get_pin_value(file, idx, size)
         name = f'PAD{len(structures.index)}'
@@ -232,7 +320,6 @@ def load_cluster_B(cluster_name, mt_br, file, cluster_size, idx, size, __idx):
 
 
 def load_cluster_A(file, idx, size, mt_br):
-
     idx, cluster_size, cluster_name = get_sub_header(file, idx, size)
     __idx = copy.copy(idx)
 
@@ -263,13 +350,13 @@ def __load(filename, maintain_borrows):
             head = file.read(1)
             idx += 1
             match head:
-                case b"$":  # Cluster
+                case b"=":  # Cluster
                     cluster, idx = load_cluster_A(file, idx, size, maintain_borrows)
                     database.add(cluster)
                 case b"?":  # Jar (Pickle)
                     jar, idx = open_jar_A(file, idx, size, maintain_borrows)
                     database.add(jar)
-                case b"":   # EOF
+                case b"":  # EOF
                     break
                 case _:
                     raise Exceptions.SubHeadError(f"Invalid sub-header '{head.decode()}'", "load")
@@ -284,6 +371,18 @@ def clean():
 
 
 def load(filename, maintain_borrows=False, _clean=True):
+    """
+    Load an entire database as a `DataBase` object.
+    (Everything is loaded into memory, so not optimal)
+    :param filename:
+    :param maintain_borrows:
+    Load a borrowed element as a `Borrow`, otherwise load
+    as the object to be borrowed
+    :param _clean:
+    Destroy object index (please enable)
+    :return:
+    A fully loaded `DataBase`
+    """
     try:
         loaded = __load(filename, maintain_borrows)
         if _clean:

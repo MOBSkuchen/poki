@@ -1,5 +1,6 @@
 import copy
 import threading
+from dataclasses import dataclass
 import os
 import asyncio
 import zstandard as zst
@@ -18,11 +19,11 @@ class Borrow:
     def get(self):
         return self.value
 
-    def format(self):
-        return f'@{index[self.value.name]}'
+    def eval(self):
+        return f'@{index[self.value.name]}'.encode()
 
     def __repr__(self):
-        return self.format()
+        return self.eval()
 
 
 class Atom:
@@ -31,7 +32,7 @@ class Atom:
         if _t == str:
             self.value = value.encode()
         elif _t == Borrow:
-            self.value = value.format().encode()
+            self.value = value.eval()
         else:
             self.value = bytes(value)
         self.name = name
@@ -54,7 +55,7 @@ class Pin:
         if _t == str:
             self.value = value.encode()
         elif _t == Borrow:
-            self.value = value.format().encode()
+            self.value = value.eval().encode()
         else:
             self.value = bytes(value)
 
@@ -76,19 +77,19 @@ class Pin:
 
 
 class Cluster:
-    def __init__(self, title, particles: list[Atom]):
+    def __init__(self, title, particles: list[Atom | Pin]):
         self.title = title
-        self.particles = {}
+        self.particles: dict[str, Atom | Pin] = {}
         for p in particles:
             self.particles[p.name] = p
 
-    def add(self, particle):
+    def add(self, particle: Atom | Pin):
         self.particles[particle.name] = particle
 
     def delete(self, name):
         del self.particles[name]
 
-    def format(self):
+    def eval(self):
         x = [at.eval() for n, at in self.particles.items()]
         return b"\n".join(x)
 
@@ -122,11 +123,20 @@ class Jar:
         self.title = title
         self.obj = obj
 
-    def format(self):
+    def eval(self):
         return pickle.dumps(self.obj)
 
     def __repr__(self):
         return self.obj.__repr__()
+
+
+@dataclass(frozen=True, order=True)
+class DataBaseHeader:
+    level: str
+    realname: str
+    name: str
+    idx: int
+    size: int
 
 
 class DataBase:
@@ -134,8 +144,31 @@ class DataBase:
         self.__mprocs = {}
         self.name = name
         self.location = location
+        self._loaded_header = self._load_header()
         self.elements = {}
+
+    def reload(self):
+        self._loaded_header = self._load_header()
+
+    def _load_header(self):
+        from tools import get_db_header
         self._size = os.path.getsize(self.location) if os.path.exists(self.location) else -1
+        if self._size == -1:
+            return
+        file = open(self.location, 'rb')
+        level, realname, _name, idx, size = get_db_header(file, self._size)
+        idx += 1
+        dbh = DataBaseHeader(level, realname, _name, idx, size)
+        return dbh
+
+    def _get_ready_file(self):
+        from tools import level_decompile
+        file = open(self.location, 'r+b')
+        level = self._loaded_header.level
+        size = self._loaded_header.size
+        file.seek(self._loaded_header.idx)
+        file = level_decompile(level, file, size)
+        return file
 
     def _get_header(self, secure, compression, size):
         _header = f"{self.name};{self.location};{size if size else ''}\n"
@@ -177,10 +210,10 @@ class DataBase:
     def _indiv_asm(self, element):
         _t = type(element)
         if _t == Cluster:
-            _header = "$"
+            _header = "="
         else:
             _header = "?"
-        fmt = element.format()
+        fmt = element.eval()
         _header += f"{element.title}:{len(fmt)}\n"
         return _header.encode() + fmt
 
@@ -192,8 +225,26 @@ class DataBase:
     def add(self, element):
         self.elements[element.title] = element
 
-    def remove(self, name):
+    def delete(self, name):
         del self.elements[name]
+
+    def find(self, name, maintain_borrows=True):
+        from tools import find_sub_header
+        size = self._loaded_header.size
+        idx = self._loaded_header.idx
+        _reg_stream_file = self._get_ready_file()
+        _reg_stream_file.seek(idx)
+        res = find_sub_header(_reg_stream_file, name)
+        file = self._get_ready_file()
+        for (start, end) in res:
+            file.seek(idx + start)
+            _type, _size, idx, _name = self._get_sub_header_item(file, size, start)
+            idx += _size
+            __idx = copy.copy(idx)
+            yield self._construct_sub_header(file, _size, size, __idx, idx, maintain_borrows, _type, _name)
+
+        _reg_stream_file.close()
+        file.close()
 
     def __mproc_getID(self):
         return f'id{len(self.__mprocs)}'
@@ -205,16 +256,6 @@ class DataBase:
         thread = threading.Thread(target=_, args=(element,))
         thread.start()
 
-    async def __mproc_update(self, *args):  # file, size, idx, _id, check, _size, _name
-        def _(file, size, idx, _id, check, _size, _name):
-            asm = self.__mprocs[_id]
-            if check and self._hash_compare(file, _size, asm):
-                return
-            self._main_update_block(file, idx, _size, size, _name, asm)
-
-        thread = threading.Thread(target=_, args=args)
-        thread.start()
-
     def _main_update_block(self, file, idx, blocksize, filesize, blockname, asm):
         _asm_size = len(asm)
         _header_size = len(str(blocksize)) + len(blockname) + 2
@@ -223,7 +264,7 @@ class DataBase:
         saved = copy.copy(idx)
         if _asm_size == blocksize:  # Same size
             file.write(asm)
-        elif _asm_size > blocksize:  # New bigger than old one
+        elif _asm_size > blocksize:  # New one bigger than old one
             idx += blocksize + _header_size + 1
             file.seek(idx, 0)
             mid = file.read(filesize - idx)
@@ -243,15 +284,15 @@ class DataBase:
             file.truncate(idx)
 
     def update(self, name, element=None, check=False):
-        from tools import level_decompile, get_db_header
         _id = self.__mproc_getID()
         if element is None:
             element = self.elements[name]
 
         asyncio.run(self.__mproc_asm(_id, element))
-        file = open(self.location, 'r+b')
-        level, realname, _name, idx, size = get_db_header(file, self._size)
-        file = level_decompile(level, file, size)
+        level = self._loaded_header.level
+        size = self._loaded_header.size
+        idx = self._loaded_header.idx
+        file = self._get_ready_file()
         while True:
             _type, _size, idx, _name = self._get_sub_header_item(file, size, idx)
             if name == _name:
@@ -264,10 +305,31 @@ class DataBase:
             return
 
         if not level == "N":
-            raise Exceptions.UnsupportedError(f"The level '{level}' is not supported (might get changed in the future)", "update_all")
+            raise Exceptions.UnsupportedError(f"The level '{level}' is not supported (might get changed in the future)",
+                                              "update_all")
         self._main_update_block(file, idx, _size, size, _name, asm)
 
         file.close()
+
+    def __attr_get(self, item):
+        if type(item) is int:
+            return list(self.elements.keys())[item]
+        return item
+
+    def __getitem__(self, item):
+        item = self.__attr_get(item)
+        return self.elements[item]
+
+    def __delitem__(self, item):
+        item = self.__attr_get(item)
+        self.delete(item)
+
+    def __contains__(self, item):
+        return item in self.elements.keys()
+
+    def __setitem__(self, key, value):
+        key = self.__attr_get(key)
+        self.elements[key] = value
 
     @staticmethod
     def _hash_compare(file, size, cmp, rewindable, with_header=True):
@@ -291,10 +353,10 @@ class DataBase:
         :return:
         None
         """
-        from tools import level_decompile, get_db_header
-        file = open(self.location, 'r+b')
-        level, realname, _name, idx, size = get_db_header(file, self._size)
-        file = level_decompile(level, file, size)
+        level = self._loaded_header.level
+        size = self._loaded_header.size
+        idx = self._loaded_header.idx
+        file = self._get_ready_file()
         while True:
             _id = self.__mproc_getID()
             _type, _size, idx, _name = self._get_sub_header_item(file, size, idx)
@@ -315,15 +377,16 @@ class DataBase:
             head = file.read(1).decode()
             idx += 1
             match head:
-                case "$":  # Cluster
+                case "=":  # Cluster
                     idx, _size, _name = get_sub_header(file, idx, size)
-                    t = "$"
+                    t = "="
                 case "?":  # Jar (Pickle)
                     idx, _size, _name = get_sub_header(file, idx, size)
                     t = "?"
                 case "":  # EOF
                     return None, None, idx, None
                 case _:
+                    print(head.encode())
                     raise Exceptions.SubHeadError(f"Invalid sub-header '{head}'", "_get_sub_header_item")
 
             return t, _size, idx, _name
@@ -331,7 +394,7 @@ class DataBase:
     def _construct_sub_header(self, file, _size, size, __idx, idx, mt_br, _type, name):
         from tools import load_cluster_B, open_jar_B
         match _type:
-            case "$":  # Cluster
+            case "=":  # Cluster
                 return load_cluster_B(name, mt_br, file, _size, idx, size, __idx)[0]
             case "?":  # Jar (Pickle)
                 return open_jar_B(file, name, _size, idx)[0]
@@ -343,6 +406,7 @@ class DataBase:
                 break
             else:
                 file.read(_size + 1)
+                idx += _size + 1
         idx += _size
         __idx = copy.copy(idx)
         return self._construct_sub_header(file, _size, size, __idx, idx, mt_br, _type, _name)
@@ -354,12 +418,9 @@ class DataBase:
             __idx = copy.copy(idx)
             yield self._construct_sub_header(file, _size, size, __idx, idx, mt_br, _type, _name)
 
-    def _add(self, element):
-        self.elements[element.title] = element
-
     def __gen_load(self, file, amount, size, idx, maintain_borrows):
         for i in self._get_sub_headers_by_amount(amount, file, size, idx, maintain_borrows):
-            self._add(i)
+            self.add(i)
             yield i
 
         file.close()
@@ -384,15 +445,14 @@ class DataBase:
         When using amount:
             Generator of loaded `Cluster` or `Jar`
         """
-        from tools import get_db_header, level_decompile
         if name == amount is None or name and amount:
             raise Exception
-        file = open(self.location, 'rb')
-        level, realname, _name, idx, size = get_db_header(file, self._size)
-        file = level_decompile(level, file, size)
+        size = self._loaded_header.size
+        idx = self._loaded_header.idx
+        file = self._get_ready_file()
         if name:
             i = self._get_sub_header_by_name(name, file, size, idx, maintain_borrows)
-            self._add(i)
+            self.add(i)
             return i
         else:
             gen = self.__gen_load(file, amount, size, idx, maintain_borrows)
