@@ -29,3 +29,13 @@ class Exceptions:
     class UnsupportedError(BaseException):
         def __init__(self, msg, level, *args):
             super().__init__("Unsupported operation", msg, level, *args)
+
+    class AlreadyConnected(BaseException):
+        def __init__(self, msg, level, *args):
+            super().__init__("The remote server has already been connected to", msg, level, *args)
+
+
+class CloseConnection(Exception):
+    def __init__(self, socket):
+        self.S = socket
+        self.S.close()

@@ -4,6 +4,8 @@ import os
 import copy
 import pickle
 import zstandard as zst
+
+from remote import RemoteDataBaseAccessor
 from structures import Atom, Borrow, Jar, Pin, Cluster, DataBase
 import structures
 
@@ -227,7 +229,7 @@ def get_piece(file, idx, size):
     if h == "!":  # Indicate PIN
         t = 1
         borrow, value, idx = get_pin_value(file, idx, size)
-        name = f'PAD{len(structures.index)}'
+        name = f'PIN{len(structures.index)}'
         return borrow, name, value, idx, t
     else:
         t = 0
@@ -340,11 +342,20 @@ def open_jar_A(file, idx, size, mt_br):
     return open_jar_B(file, jar_name, jar_size, idx)
 
 
-def __load(filename, maintain_borrows):
+def local_prep_load(filename):
     size = os.path.getsize(filename)
-    with open(filename, 'rb') as file:
+    file = open(filename, 'rb')
+    return file, size
+
+
+def remote_prep_load(db_acc: RemoteDataBaseAccessor):
+    return db_acc.open(), db_acc.size
+
+
+def __load(file, size, maintain_borrows, RDA):
+    with file:
         level, realname, name, idx, size = get_db_header(file, size)
-        database = DataBase(name, realname)
+        database = DataBase(name, realname, RDA)
         file = level_decompile(level, file, size - idx)
         while size > idx:
             head = file.read(1)
@@ -365,26 +376,37 @@ def __load(filename, maintain_borrows):
 
 
 def clean():
+    """
+    Clean the `index`
+    """
     global part
     part = {}
     structures.index = {}
 
 
-def load(filename, maintain_borrows=False, _clean=True):
+def load(filename, maintain_borrows=False, _clean=True, RDA: RemoteDataBaseAccessor = None):
     """
     Load an entire database as a `DataBase` object.
     (Everything is loaded into memory, so not optimal)
     :param filename:
+    Filename of the database
     :param maintain_borrows:
     Load a borrowed element as a `Borrow`, otherwise load
     as the object to be borrowed
     :param _clean:
     Destroy object index (please enable)
+    :param RDA:
+    RemoteDataBaseAccessor used for accessing a file on the remote server,
+    leave None if it is a local file
     :return:
     A fully loaded `DataBase`
     """
     try:
-        loaded = __load(filename, maintain_borrows)
+        if not RDA:
+            file, size = local_prep_load(filename)
+        else:
+            file, size = remote_prep_load(RDA)
+        loaded = __load(file, size, maintain_borrows, RDA)
         if _clean:
             clean()
         return loaded

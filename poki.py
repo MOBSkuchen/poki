@@ -1,6 +1,16 @@
 import io
 from exceptions import Exceptions
-from structures import Atom, Cluster, DataBase, Jar, Pin
+from structures import Atom, Cluster, Jar, Pin
+from remote import Connector, SSHCredentials
+
+
+def create_connector():
+    con = Connector(SSHCredentials("server.addr", "username", "password"))
+    con.connect()
+    return con
+
+
+con = create_connector()
 
 
 def db_make():
@@ -8,25 +18,28 @@ def db_make():
     parts = [_, Atom("msg", _.borrow())]
     cluster = Cluster("words", parts)
     cluster.add(Pin("hello"))
+    db = con.open_database("database", "database.db")
 
-    db = DataBase("database", "database.db")
     db.add(cluster)
     jar = Jar("string", io.StringIO("Hello World, string!!"))  # The size of this is 69, nice
     db.add(jar)
 
-    db.export(compression=True)
+    db.export()
 
 
 def main():
     db_make()
-    db = DataBase("database", "database.db")
+    db = con.open_database("database", "database.db")
     element = db.load(name="words")
     element.add(element[1].borrow())
-    # db.update_all()
 
     gen = db.find("words")
     for i in gen:
         print(i)
+
+    print(db)
+
+    con.close()
 
 
 if __name__ == '__main__':
@@ -39,3 +52,4 @@ if __name__ == '__main__':
             print(f'Internal Error (while formatting error message) : {str(ex)}')
     except Exception as ex:
         print(f'Internal Error : {str(ex)}')
+        raise ex

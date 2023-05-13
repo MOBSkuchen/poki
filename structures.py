@@ -5,13 +5,22 @@ import os
 import asyncio
 import zstandard as zst
 from exceptions import Exceptions
-from hashlib import sha256
+from remote import RemoteDataBaseAccessor
+from hashlib import sha1
 import pickle
 
+"""
+The index is a table of all registered value,
+it is [for example] used to address PINs
+"""
 index = {}
 
 
 class Borrow:
+    """
+    A borrowed value is an exact copy of an
+    original mini value -> Atom or Pin
+    """
     def __init__(self, value):
         self.value: Atom | Pin = value
         self.name = self.value.name
@@ -20,13 +29,18 @@ class Borrow:
         return self.value
 
     def eval(self):
-        return f'@{index[self.value.name]}'.encode()
+        return f'@{index[self.value.name].name}'.encode()
 
     def __repr__(self):
-        return self.eval()
+        return f'Borrow of {self.value.name}'
 
 
 class Atom:
+    """
+    An atom is a named value,
+    it assigns a name to a value
+    which it can be addressed from
+    """
     def __init__(self, name, value):
         _t = type(value)
         if _t == str:
@@ -46,10 +60,14 @@ class Atom:
         return Borrow(self)
 
     def __repr__(self):
-        return self.name
+        return f'{self.name}[A]'
 
 
 class Pin:
+    """
+    A pin is a value without a name,
+    it is addressed by its index
+    """
     def __init__(self, value, name=None):
         _t = type(value)
         if _t == str:
@@ -60,7 +78,7 @@ class Pin:
             self.value = bytes(value)
 
         if name is None:
-            self.name = f'PAD{len(index)}'
+            self.name = f'PIN{len(index)}'
         else:
             self.name = name
 
@@ -73,7 +91,7 @@ class Pin:
         return Borrow(self)
 
     def __repr__(self):
-        return self.name
+        return f'{self.name}[P]'
 
 
 class Cluster:
@@ -114,8 +132,7 @@ class Cluster:
         self.particles[key] = value
 
     def __repr__(self):
-        _ = "\n> "
-        return f'{self.title}\n> {_.join([p.__repr__() for n, p in self.particles.items()])}'
+        return f"Cluster ('{self.title}') of {len(self.particles)} elements"
 
 
 class Jar:
@@ -127,7 +144,7 @@ class Jar:
         return pickle.dumps(self.obj)
 
     def __repr__(self):
-        return self.obj.__repr__()
+        return repr(self.obj)
 
 
 @dataclass(frozen=True, order=True)
@@ -140,22 +157,53 @@ class DataBaseHeader:
 
 
 class DataBase:
-    def __init__(self, name, location):
+    def __init__(self, name, location, RDA: RemoteDataBaseAccessor = None):
+        self._size = None
         self.__mprocs = {}
         self.name = name
         self.location = location
+        self.RDA = RDA
         self._loaded_header = self._load_header()
         self.elements = {}
 
     def reload(self):
+        """
+        Reload the entire database
+        """
         self._loaded_header = self._load_header()
+
+    def file_open(self, filename, mode, *args):
+        """
+        Open the file
+        :param filename:
+        :param mode:
+        Mode (like 'r', 'rb', 'r', 'wb')
+        :param args:
+        Rest of the arguments
+        :return:
+        Opened file
+        """
+        if self.RDA is None:
+            return open(filename, mode, *args)
+        else:
+            return self.RDA.open(filename, mode, *args)
+
+    def get_size(self):
+        """
+        Get (file) size of the DB
+        """
+        if self.RDA is None:
+            self._size = os.path.getsize(self.location) if os.path.exists(self.location) else -1
+            return self._size
+        else:
+            return self.RDA.size if self.RDA.exists() else -1
 
     def _load_header(self):
         from tools import get_db_header
-        self._size = os.path.getsize(self.location) if os.path.exists(self.location) else -1
+        self._size = self.get_size()
         if self._size == -1:
             return
-        file = open(self.location, 'rb')
+        file = self.file_open(self.location, 'rb')
         level, realname, _name, idx, size = get_db_header(file, self._size)
         idx += 1
         dbh = DataBaseHeader(level, realname, _name, idx, size)
@@ -163,7 +211,7 @@ class DataBase:
 
     def _get_ready_file(self):
         from tools import level_decompile
-        file = open(self.location, 'r+b')
+        file = self.file_open(self.location, 'r+b')
         level = self._loaded_header.level
         size = self._loaded_header.size
         file.seek(self._loaded_header.idx)
@@ -184,11 +232,18 @@ class DataBase:
         return _header.encode()
 
     def export(self, secure=False, compression=False):
+        """
+        Export an entire database to a file
+        :param secure:
+        Not implemented
+        :param compression:
+        Whether to compress using ZSTD
+        """
         size = 0
         if compression:
             gen = self.assemble()
             zstd = zst.ZstdCompressor()
-            with open(self.location, 'wb') as file:
+            with self.file_open(self.location, 'wb') as file:
                 stream = zstd.stream_writer(file)
                 for asm in gen:
                     stream.write(asm)
@@ -200,7 +255,7 @@ class DataBase:
             return
 
         gen = self.assemble()
-        with open(self.location, 'wb') as file:
+        with self.file_open(self.location, 'wb') as file:
             file.write(self._get_header(secure, compression, None))
             for asm in gen:
                 file.write(asm)
@@ -218,17 +273,41 @@ class DataBase:
         return _header.encode() + fmt
 
     def assemble(self):
+        """
+        Assemble the database to a bytes representation
+        :return:
+        A generator of the sub-headers and their contents
+        """
         for element_name in self.elements.keys():
             element = self.elements[element_name]
             yield self._indiv_asm(element)
 
     def add(self, element):
+        """
+        Add an element to the database IMR (In-Memory-Representation)
+        :param element:
+        Element
+        """
         self.elements[element.title] = element
 
     def delete(self, name):
+        """
+        Delete an element from the database IMR (In-Memory-Representation)
+        :param name:
+        Name of the element
+        """
         del self.elements[name]
 
     def find(self, name, maintain_borrows=True):
+        """
+        Find an element (sub-header) in the database
+        :param name:
+        Name of the sub-header
+        :param maintain_borrows:
+        Whether to maintain borrows
+        :return:
+        Generator of results
+        """
         from tools import find_sub_header
         size = self._loaded_header.size
         idx = self._loaded_header.idx
@@ -284,6 +363,17 @@ class DataBase:
             file.truncate(idx)
 
     def update(self, name, element=None, check=False):
+        """
+        Update a specified element
+        NOTE : Please only use if you have small changes,
+        it is more effective to use `export` for
+        big changes.
+        :param check:
+        Whether to check if the block is the same,
+        can save a lot of time if the time taken
+        to write the change is significantly bigger
+        than the time it takes to do a hash compare.
+        """
         _id = self.__mproc_getID()
         if element is None:
             element = self.elements[name]
@@ -335,23 +425,24 @@ class DataBase:
     def _hash_compare(file, size, cmp, rewindable, with_header=True):
         if with_header:
             header, cmp = cmp.split(b"\n", 1)
-        _cmp = sha256(cmp)
+        _cmp = sha1(cmp)
         loaded = file.read(size)
-        hashed = sha256(loaded)
+        hashed = sha1(loaded)
         if rewindable:
             file.seek(-size, 1)  # Normally we could just use file.seek(-size, 1), but we must support compression
         return _cmp.digest() == hashed.digest()
 
     def update_all(self, check=True):
         """
-        Please only use if you have small changes,
+        Update all elements
+        NOTE : Please only use if you have small changes,
         it is more effective to use `export` for
         big changes.
         :param check:
         Whether to check if the block is the same,
-        can save a lot of time
-        :return:
-        None
+        can save a lot of time if the time taken
+        to write the change is significantly bigger
+        than the time it takes to do a hash compare.
         """
         level = self._loaded_header.level
         size = self._loaded_header.size
@@ -425,6 +516,14 @@ class DataBase:
 
         file.close()
 
+    def __repr__(self):
+        res = f"Database {self.name} ({self.get_size()}) at {self.location}"
+        if self.RDA:
+            res += " [REMOTE]"
+        res += "\n"
+        res += f"ELEMENTS (LOADED) : {len(self.elements)}\n"
+        return res
+
     def load(self, name=None, amount=None, maintain_borrows=False):
         """
         Load one or more sub-header items from a database file,
@@ -432,7 +531,7 @@ class DataBase:
         Please note : When using a generator, it must be consumed until
                       the items are added.
 
-                      Either name or amount must be specified.
+                      Either name or amount must be specified!
         :param name:
         Sub-header name
         :param amount:
